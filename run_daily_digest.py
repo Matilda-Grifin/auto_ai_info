@@ -22,6 +22,16 @@ DEFAULT_OUTPUT_DIR = "daily_docs"
 USER_AGENT = "ai-digest-agent/0.1 (+local-script)"
 ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
 OPENCLAW_LEADERBOARD_URL = "https://topclawhubskills.com/"
+DEFAULT_ALLOWED_LLM_HOSTS = {
+    "ark.cn-beijing.volces.com",
+    "api.openai.com",
+    "openrouter.ai",
+}
+ALLOWED_WEBHOOK_SUFFIXES = (
+    ".feishu.cn",
+    ".larksuite.com",
+    ".dingtalk.com",
+)
 
 
 def now_local() -> dt.datetime:
@@ -49,7 +59,7 @@ def load_dotenv(path: pathlib.Path) -> None:
             os.environ[key] = value
 
 
-def fetch_text(url: str, timeout: int = 15, allow_insecure_fallback: bool = True) -> str:
+def fetch_text(url: str, timeout: int = 15, allow_insecure_fallback: bool = False) -> str:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
 
     def _read_with_context(context: ssl.SSLContext) -> str:
@@ -91,7 +101,7 @@ def strip_tags(raw: str) -> str:
 
 
 def fetch_openclaw_stars_top(
-    top_n: int = 3, focus_skill: str = "", allow_insecure_fallback: bool = True
+    top_n: int = 3, focus_skill: str = "", allow_insecure_fallback: bool = False
 ) -> tuple[list[dict], dict | None, str]:
     html_text = fetch_text(
         OPENCLAW_LEADERBOARD_URL,
@@ -386,14 +396,20 @@ def category_order_key(name: str) -> tuple[int, str]:
     return (preferred.get(name, 90), name)
 
 
-def call_ark_chat(api_key: str, model: str, messages: list[dict], timeout: int = 90) -> str:
+def call_chat_completion(
+    api_key: str,
+    model: str,
+    messages: list[dict],
+    base_url: str,
+    timeout: int = 90,
+) -> str:
     payload = {
         "model": model,
         "messages": messages,
         "temperature": 0.2,
     }
     req = urllib.request.Request(
-        ARK_BASE_URL,
+        base_url,
         data=json.dumps(payload).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
@@ -402,27 +418,99 @@ def call_ark_chat(api_key: str, model: str, messages: list[dict], timeout: int =
         },
         method="POST",
     )
-    def _send_with_context(context: ssl.SSLContext) -> str:
-        with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
-            return resp.read().decode("utf-8", errors="ignore")
-
-    try:
-        body = _send_with_context(ssl.create_default_context())
-    except ssl.SSLCertVerificationError:
-        body = _send_with_context(ssl._create_unverified_context())
-    except urllib.error.URLError as ex:
-        if isinstance(ex.reason, ssl.SSLCertVerificationError):
-            body = _send_with_context(ssl._create_unverified_context())
-        else:
-            raise
+    with urllib.request.urlopen(req, timeout=timeout, context=ssl.create_default_context()) as resp:
+        body = resp.read().decode("utf-8", errors="ignore")
     data = json.loads(body)
     try:
         return data["choices"][0]["message"]["content"]
     except Exception as ex:  # noqa: BLE001
-        raise ValueError(f"invalid ark response: {ex}") from ex
+        raise ValueError(f"invalid chat completion response: {ex}") from ex
 
 
-def fetch_article_excerpt(url: str, allow_insecure_fallback: bool = True) -> str:
+def normalize_chat_completions_url(raw_url: str) -> str:
+    url = (raw_url or "").strip()
+    if not url:
+        return ""
+    if url.endswith("/v1"):
+        return url + "/chat/completions"
+    if url.endswith("/chat/completions"):
+        return url
+    return url.rstrip("/") + "/chat/completions"
+
+
+def validate_https_url(url: str, field_name: str) -> urllib.parse.ParseResult:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme.lower() != "https" or not parsed.netloc:
+        raise ValueError(f"{field_name} must be a valid https URL")
+    return parsed
+
+
+def allowed_llm_hosts_from_env() -> set[str]:
+    raw = os.getenv("LLM_ALLOWED_HOSTS", "")
+    extra = {x.strip().lower() for x in raw.split(",") if x.strip()}
+    return {h.lower() for h in DEFAULT_ALLOWED_LLM_HOSTS} | extra
+
+
+def resolve_llm_runtime(args: argparse.Namespace) -> tuple[str, str, str]:
+    # Backward-compatible API key resolution: Ark first, then common OpenAI-style env names.
+    api_key = (
+        args.ark_api_key
+        or os.getenv("ARK_API_KEY", "")
+        or os.getenv("OPENAI_API_KEY", "")
+        or os.getenv("api_key", "")
+        or os.getenv("API_KEY", "")
+        or ""
+    ).strip()
+
+    ark_model_or_ep = (
+        args.ark_endpoint_id
+        or os.getenv("ARK_ENDPOINT_ID", "")
+        or args.ark_model
+        or os.getenv("ARK_MODEL", "")
+        or ""
+    ).strip()
+    openai_model = (os.getenv("OPENAI_MODEL", "") or os.getenv("MODEL", "")).strip()
+    model = ark_model_or_ep or openai_model or "Doubao-Seed-1.6-lite"
+
+    provider = (args.llm_provider or "auto").strip().lower()
+    if provider not in {"auto", "ark", "openai-compatible"}:
+        provider = "auto"
+
+    # Auto mode: if Ark-specific vars exist, keep Ark behavior; otherwise use OpenAI-compatible.
+    has_ark_hint = bool(
+        args.ark_endpoint_id or os.getenv("ARK_ENDPOINT_ID") or os.getenv("ARK_MODEL")
+    )
+    if provider == "auto":
+        provider = "ark" if has_ark_hint else "openai-compatible"
+
+    if provider == "ark":
+        base_url = (os.getenv("ARK_BASE_URL", "") or ARK_BASE_URL).strip()
+    else:
+        base_url = (
+            args.llm_base_url
+            or os.getenv("OPENAI_BASE_URL", "")
+            or os.getenv("LLM_BASE_URL", "")
+            or ""
+        ).strip()
+        if not base_url:
+            raise ValueError(
+                "openai-compatible mode requires OPENAI_BASE_URL (or --llm-base-url)"
+            )
+        base_url = normalize_chat_completions_url(base_url)
+
+    base_url = normalize_chat_completions_url(base_url)
+    parsed = validate_https_url(base_url, "LLM base URL")
+    host = (parsed.hostname or "").lower()
+    if not args.allow_custom_llm_endpoint and host not in allowed_llm_hosts_from_env():
+        raise ValueError(
+            f"LLM endpoint host '{host}' is not in allowlist. "
+            "Use --allow-custom-llm-endpoint or set LLM_ALLOWED_HOSTS."
+        )
+
+    return provider, base_url, api_key
+
+
+def fetch_article_excerpt(url: str, allow_insecure_fallback: bool = False) -> str:
     if not url:
         return ""
     # Avoid non-HTML pages such as PDF downloads.
@@ -441,7 +529,11 @@ def fetch_article_excerpt(url: str, allow_insecure_fallback: bool = True) -> str
 
 
 def enrich_items_with_llm(
-    items: list[dict], api_key: str, model: str, allow_insecure_fallback: bool
+    items: list[dict],
+    api_key: str,
+    model: str,
+    base_url: str,
+    allow_insecure_fallback: bool,
 ) -> tuple[str, list[str], list[str]]:
     if not items:
         return "今日暂无可分析资讯。", [], []
@@ -482,9 +574,10 @@ def enrich_items_with_llm(
         "news": rows,
     }
 
-    content = call_ark_chat(
+    content = call_chat_completion(
         api_key=api_key,
         model=model,
+        base_url=base_url,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False)},
@@ -694,10 +787,17 @@ def write_doc(output_dir: pathlib.Path, content: str) -> pathlib.Path:
 
 
 def post_webhook(url: str, text: str) -> tuple[bool, str]:
-    parsed = urllib.parse.urlparse(url)
-    if "feishu" in parsed.netloc or "lark" in parsed.netloc:
+    try:
+        parsed = validate_https_url(url, "webhook URL")
+    except ValueError as ex:
+        return False, str(ex)
+    host = (parsed.hostname or "").lower()
+    if not (host.endswith(ALLOWED_WEBHOOK_SUFFIXES) or host in {"feishu.cn", "larksuite.com", "dingtalk.com"}):
+        return False, "Unsupported webhook host (expect Feishu/Lark or DingTalk official domains)"
+
+    if host.endswith(".feishu.cn") or host.endswith(".larksuite.com") or host == "feishu.cn" or host == "larksuite.com":
         payload = {"msg_type": "text", "content": {"text": text}}
-    elif "dingtalk" in parsed.netloc:
+    elif host.endswith(".dingtalk.com") or host == "dingtalk.com":
         payload = {"msgtype": "text", "text": {"content": text}}
     else:
         return False, "Unsupported webhook host (expect feishu/lark or dingtalk)"
@@ -735,19 +835,35 @@ def main() -> int:
         help="Send message to webhook after generating markdown",
     )
     parser.add_argument(
-        "--strict-ssl",
+        "--allow-insecure-ssl",
         action="store_true",
-        help="Disable insecure SSL fallback and fail on certificate issues",
+        help="Allow insecure SSL fallback (not recommended)",
     )
     parser.add_argument(
         "--use-llm",
         action="store_true",
-        help="Use Ark model to generate Chinese overview/details",
+        help="Use LLM to generate Chinese overview/details",
+    )
+    parser.add_argument(
+        "--llm-provider",
+        default="auto",
+        choices=["auto", "ark", "openai-compatible"],
+        help="LLM provider mode",
+    )
+    parser.add_argument(
+        "--llm-base-url",
+        default=os.getenv("OPENAI_BASE_URL", ""),
+        help="OpenAI-compatible chat completions URL",
+    )
+    parser.add_argument(
+        "--allow-custom-llm-endpoint",
+        action="store_true",
+        help="Allow non-allowlisted LLM endpoint host (use with caution)",
     )
     parser.add_argument(
         "--ark-model",
         default=os.getenv("ARK_MODEL", "Doubao-Seed-1.6-lite"),
-        help="Ark model name",
+        help="Ark model name (legacy arg, still supported)",
     )
     parser.add_argument(
         "--ark-endpoint-id",
@@ -757,7 +873,7 @@ def main() -> int:
     parser.add_argument(
         "--ark-api-key",
         default="",
-        help="Ark API key (higher priority than .env)",
+        help="Ark API key (legacy arg, higher priority than env)",
     )
     parser.add_argument(
         "--window-hours",
@@ -806,7 +922,7 @@ def main() -> int:
     items, errors = collect_news(
         sources,
         max(1, args.limit),
-        allow_insecure_fallback=not args.strict_ssl,
+        allow_insecure_fallback=args.allow_insecure_ssl,
         window_hours=args.window_hours,
     )
 
@@ -818,7 +934,7 @@ def main() -> int:
             more_items, more_errors = collect_news(
                 official_sources,
                 max(1, args.limit),
-                allow_insecure_fallback=not args.strict_ssl,
+                allow_insecure_fallback=args.allow_insecure_ssl,
                 window_hours=max(args.window_hours, args.official_window_hours),
             )
             items = dedupe_items(items + more_items)
@@ -845,42 +961,40 @@ def main() -> int:
         openclaw_top, openclaw_focus, openclaw_asof = fetch_openclaw_stars_top(
             top_n=3,
             focus_skill=args.focus_skill,
-            allow_insecure_fallback=not args.strict_ssl,
+            allow_insecure_fallback=args.allow_insecure_ssl,
         )
     except Exception as ex:  # noqa: BLE001
         errors.append(f"OpenClaw热榜: {type(ex).__name__} {ex}")
 
     if args.use_llm:
-        ark_api_key = (
-            args.ark_api_key
-            or os.getenv("ARK_API_KEY")
-            or os.getenv("api_key")
-            or os.getenv("API_KEY")
-            or ""
-        )
-        if not ark_api_key:
-            errors.append("LLM: 未检测到 ARK_API_KEY（或 api_key）")
-        else:
-            try:
-                ark_model_or_ep = (
+        try:
+            provider, base_url, api_key = resolve_llm_runtime(args)
+            if not api_key:
+                errors.append("LLM: 未检测到可用 API Key（ARK_API_KEY 或 OPENAI_API_KEY）")
+            else:
+                model = (
                     args.ark_endpoint_id
                     or os.getenv("ARK_ENDPOINT_ID", "")
                     or args.ark_model
                     or os.getenv("ARK_MODEL", "")
+                    or os.getenv("OPENAI_MODEL", "")
+                    or os.getenv("MODEL", "")
                     or "Doubao-Seed-1.6-lite"
                 )
                 llm_overview, llm_details, llm_titles_cn = enrich_items_with_llm(
                     items,
-                    ark_api_key,
-                    ark_model_or_ep,
-                    allow_insecure_fallback=not args.strict_ssl,
+                    api_key,
+                    model,
+                    base_url=base_url,
+                    allow_insecure_fallback=args.allow_insecure_ssl,
                 )
-            except Exception as ex:  # noqa: BLE001
-                hint = ""
-                msg = f"{type(ex).__name__} {ex}"
-                if "404" in msg:
-                    hint = "（可能需要 ARK_ENDPOINT_ID=ep-xxx，而不是模型展示名）"
-                errors.append(f"LLM: {msg}{hint}")
+                print(f"[INFO] llm_provider={provider}, llm_model={model}")
+        except Exception as ex:  # noqa: BLE001
+            hint = ""
+            msg = f"{type(ex).__name__} {ex}"
+            if "404" in msg:
+                hint = "（Ark 模式可能需要 ARK_ENDPOINT_ID=ep-xxx，而不是模型展示名）"
+            errors.append(f"LLM: {msg}{hint}")
 
     date_label = now_local().strftime("%Y-%m-%d")
     md = render_markdown(

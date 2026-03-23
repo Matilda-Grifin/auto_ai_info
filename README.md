@@ -49,12 +49,18 @@ Recommended triggers:
 Recommended command:
 
 ```bash
-python3 run_daily_digest.py --use-llm --window-hours 168 --max-paper-ratio 0.2 --min-official-items 3
+python3 run_daily_digest.py --use-llm --llm-provider auto --window-hours 168 --max-paper-ratio 0.2 --min-official-items 3
 ```
 
 Output file:
 
 - `daily_docs/ai_weekly_YYYYMMDD.md`
+
+Security-related optional flags:
+
+- `--allow-insecure-ssl`: allow SSL fallback on certificate errors (disabled by default)
+- `--allow-custom-llm-endpoint`: allow non-allowlisted LLM host (disabled by default)
+- `LLM_ALLOWED_HOSTS`: append trusted hosts via env (comma-separated)
 
 ---
 
@@ -70,12 +76,49 @@ Required:
 - `ARK_API_KEY`
 - `ARK_ENDPOINT_ID` (recommended)
 
+LLM supports two modes:
+
+1. Ark mode (compatible with existing Volcengine setup)
+2. OpenAI-compatible mode (for Chat Completions compatible gateways)
+
+Ark mode variables:
+
+- `ARK_API_KEY`
+- `ARK_MODEL`
+- `ARK_ENDPOINT_ID` (recommended for production)
+
+OpenAI-compatible variables:
+
+- `OPENAI_API_KEY`
+- `OPENAI_BASE_URL` (if it ends with `/v1`, script auto-expands to `/chat/completions`)
+- `OPENAI_MODEL` (optional, fallback applies if omitted)
+
 Optional:
 
-- `ARK_MODEL`
 - `DIGEST_WEBHOOK_URL`
 
 Open-source security conventions:
+
+About OpenClaw runtime:
+
+- If OpenClaw runtime injects variables, users can run directly.
+- If not injected, users need local `.env` or manual export before running.
+- Declare provider and env names clearly on the skill page to reduce scan mismatches.
+
+External network access declaration (for security review):
+
+- `https://ark.cn-beijing.volces.com` (Ark LLM API)
+- endpoint from `OPENAI_BASE_URL` (OpenAI-compatible mode)
+- `https://topclawhubskills.com` (OpenClaw leaderboard)
+- RSS/news domains listed in `sources.json`
+- optional notifications: Feishu/Lark or DingTalk webhook (only with `--send`)
+
+Default security policy:
+
+- all outbound URLs must be `https://`
+- LLM endpoint host is allowlisted by default
+- webhook host is limited to official Feishu/Lark/DingTalk domains
+- relaxing these limits requires explicit flags
 
 - Never commit a real `.env`
 - Commit only `.env.example`
@@ -86,7 +129,10 @@ Open-source security conventions:
 ```env
 ARK_API_KEY=your_ark_api_key_here
 ARK_ENDPOINT_ID=ep-your-endpoint-id
-ARK_MODEL=model_name
+ARK_MODEL=Doubao-Seed-1.6-lite
+OPENAI_API_KEY=
+OPENAI_BASE_URL=
+OPENAI_MODEL=
 DIGEST_WEBHOOK_URL=
 ```
 
